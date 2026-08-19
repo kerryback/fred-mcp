@@ -16,6 +16,8 @@ import urllib.request
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
 
 FRED_BASE = "https://api.stlouisfed.org/fred"
 API_KEY = os.environ.get("FRED_API_KEY", "")
@@ -236,6 +238,23 @@ def fred_get_vintage(series_id: str, vintage_date: str, start_date: str = "") ->
     )
 
 
-if __name__ == "__main__":
+def build_app():
+    """The MCP app, plus a root page so a plain health check gets a 200."""
     app = mcp.streamable_http_app()
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+    async def root(request):
+        return PlainTextResponse(
+            "FRED MCP server\n\n"
+            "MCP endpoint: /mcp\n"
+            "Tools: fred_list_catalog, fred_search_series, fred_series_info, "
+            "fred_get_observations, fred_get_vintage\n"
+            f"Catalog: {len(CATALOG)} tracked series\n"
+            f"API key configured: {'yes' if API_KEY else 'no'}\n"
+        )
+
+    app.router.routes.append(Route("/", root))
+    return app
+
+
+if __name__ == "__main__":
+    uvicorn.run(build_app(), host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
