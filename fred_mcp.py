@@ -7,25 +7,24 @@ server exposing tools, and anything that speaks MCP can call it.
 The FRED API key lives in this server's environment, not in the client. Callers get
 the data; they never get the key.
 
-That is exactly why the server itself needs a door. Anyone who can reach /mcp can
-spend this server's API key and read whatever it can read, so /mcp requires an API key
-of its own: set MCP_API_KEYS (comma separated, so keys can be added and revoked one at
-a time) and clients send either
+That is exactly why the server needs a door. Anyone who can reach /mcp can spend this
+server's API key and read whatever it can read.
 
-    Authorization: Bearer <key>
-    X-API-Key: <key>
-
-A ?key=<key> query parameter is also accepted, for clients that cannot set a header
-(the claude.ai custom-connector form is one). It is the weaker path -- a key in a URL
-ends up in server logs and browser history -- so prefer a header where you can set one.
+This is an OAuth 2.1 resource server. It does not authenticate anyone and it issues
+nothing -- it verifies bearer tokens minted by the class authorization server and
+checks that each one was issued for this resource. An unauthenticated request gets a
+401 naming where the metadata lives, and the client takes it from there.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from hmac import compare_digest
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -36,10 +35,15 @@ from starlette.routing import Route
 FRED_BASE = "https://api.stlouisfed.org/fred"
 API_KEY = os.environ.get("FRED_API_KEY", "")
 
-# The keys clients must present. Comma separated so one can be revoked without
-# disturbing the others. Empty means the server runs open, which is fine on localhost
-# and wrong anywhere else.
-API_KEYS = [k.strip() for k in os.environ.get("MCP_API_KEYS", "").split(",") if k.strip()]
+# Who issues tokens, and how we verify them. AUTH_ISSUER is advertised to clients;
+# JWT_SECRET is shared with the authorization server (HS256). No secret means the
+# server runs open, which is fine on localhost and wrong anywhere else.
+AUTH_ISSUER = os.environ.get("AUTH_ISSUER", "https://auth.kerryback.com")
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+
+# The audience every token must carry. A token minted for the EIA server names a
+# different resource and is rejected here.
+RESOURCE_URL = os.environ.get("RESOURCE_URL", "https://fred.kerryback.com/mcp")
 
 # Caps that keep a tool result small enough for a model to read.
 MAX_SEARCH_RESULTS = 30
@@ -257,43 +261,94 @@ def fred_get_vintage(series_id: str, vintage_date: str, start_date: str = "") ->
     )
 
 
-def presented_key(request) -> str:
-    """The key the caller sent, by header or, failing that, query parameter."""
-    header = request.headers.get("authorization", "")
-    scheme, _, value = header.partition(" ")
-    if scheme.lower() == "bearer" and value.strip():
-        return value.strip()
-    from_header = request.headers.get("x-api-key", "").strip()
-    if from_header:
-        return from_header
-    return request.query_params.get("key", "").strip()
+def b64u_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
-class ApiKeyAuth(BaseHTTPMiddleware):
-    """Require a valid API key on the MCP endpoint.
+def verify_token(token: str) -> dict | None:
+    """Check the signature, the expiry, the issuer, and the audience.
 
-    The root page stays open so the platform health check still gets a 200. Only the
-    tools are behind the key.
+    The audience check is the one people skip. Without it a token minted for some
+    other service would open this one -- the confused deputy the resource indicator
+    in the MCP spec exists to prevent.
+    """
+    try:
+        header, payload, sig = token.split(".")
+    except ValueError:
+        return None
+    expected = hmac.new(JWT_SECRET.encode(), f"{header}.{payload}".encode(),
+                        hashlib.sha256).digest()
+    if not hmac.compare_digest(base64.urlsafe_b64encode(expected).decode().rstrip("="), sig):
+        return None
+    try:
+        claims = json.loads(b64u_decode(payload))
+    except Exception:
+        return None
+    if claims.get("exp", 0) < time.time():
+        return None
+    if claims.get("iss") != AUTH_ISSUER:
+        return None
+    if claims.get("aud") != RESOURCE_URL:
+        return None
+    if claims.get("typ") == "refresh":       # a refresh token is not an access token
+        return None
+    return claims
+
+
+def unauthorized(detail: str):
+    """A 401 that tells the client where to go next.
+
+    The resource_metadata pointer is the whole handshake: the client reads it, finds
+    the authorization server, and starts the flow. Without it there is nothing to
+    discover and the connection just fails.
+    """
+    return JSONResponse(
+        {"error": "unauthorized", "error_description": detail},
+        status_code=401,
+        headers={
+            "WWW-Authenticate":
+                f'Bearer resource_metadata="{RESOURCE_URL.rsplit("/mcp", 1)[0]}'
+                f'/.well-known/oauth-protected-resource", scope="mcp:read"'
+        },
+    )
+
+
+class BearerTokenAuth(BaseHTTPMiddleware):
+    """Require a valid access token on the MCP endpoint.
+
+    The root page and the metadata document stay open -- the health check needs the
+    first and the OAuth handshake needs the second.
     """
 
     async def dispatch(self, request, call_next):
-        if API_KEYS and request.url.path.startswith("/mcp"):
-            given = presented_key(request)
-            # compare_digest against each key, so a wrong key cannot be timed out.
-            if not any(compare_digest(given, k) for k in API_KEYS):
-                return JSONResponse(
-                    {"error": "unauthorized: send Authorization: Bearer <key>, "
-                              "X-API-Key: <key>, or ?key=<key>"},
-                    status_code=401,
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
+        if JWT_SECRET and request.url.path.startswith("/mcp"):
+            header = request.headers.get("authorization", "")
+            scheme, _, token = header.partition(" ")
+            if scheme.lower() != "bearer" or not token.strip():
+                return unauthorized("No bearer token.")
+            if not verify_token(token.strip()):
+                return unauthorized("Token is invalid, expired, or for another resource.")
         return await call_next(request)
 
 
+async def protected_resource_metadata(request):
+    """RFC 9728. Names this resource and the authorization server that guards it.
+
+    The `resource` value must match the URL the user types into Claude exactly,
+    path included, or the client rejects it.
+    """
+    return JSONResponse({
+        "resource": RESOURCE_URL,
+        "authorization_servers": [AUTH_ISSUER],
+        "scopes_supported": ["mcp:read"],
+        "bearer_methods_supported": ["header"],
+    })
+
+
 def build_app():
-    """The MCP app, plus a root page so a plain health check gets a 200."""
+    """The MCP app, the metadata document, and a root page for the health check."""
     app = mcp.streamable_http_app()
-    app.add_middleware(ApiKeyAuth)
+    app.add_middleware(BearerTokenAuth)
 
     async def root(request):
         return PlainTextResponse(
@@ -303,10 +358,16 @@ def build_app():
             "fred_get_observations, fred_get_vintage\n"
             f"Catalog: {len(CATALOG)} tracked series\n"
             f"API key configured: {'yes' if API_KEY else 'no'}\n"
-            f"Authentication: {'API key required' if API_KEYS else 'OPEN'}\n"
+            f"Authentication: {'OAuth 2.1 bearer token' if JWT_SECRET else 'OPEN'}\n"
+            f"Authorization server: {AUTH_ISSUER}\n"
         )
 
     app.router.routes.append(Route("/", root))
+    # Both spellings: Claude probes the path-suffixed form first, then the bare one.
+    app.router.routes.append(
+        Route("/.well-known/oauth-protected-resource", protected_resource_metadata))
+    app.router.routes.append(
+        Route("/.well-known/oauth-protected-resource/mcp", protected_resource_metadata))
     return app
 
 
