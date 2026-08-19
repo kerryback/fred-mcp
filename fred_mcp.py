@@ -8,8 +8,12 @@ The FRED API key lives in this server's environment, not in the client. Callers 
 the data; they never get the key.
 
 That is exactly why the server itself needs a door. Anyone who can reach /mcp can
-spend this server's API key and read whatever it can read, so /mcp requires a bearer
-token: set MCP_AUTH_TOKEN and clients must send Authorization: Bearer <token>.
+spend this server's API key and read whatever it can read, so /mcp requires an API key
+of its own: set MCP_API_KEYS (comma separated, so keys can be added and revoked one at
+a time) and clients send either
+
+    Authorization: Bearer <key>
+    X-API-Key: <key>
 """
 
 import json
@@ -28,9 +32,10 @@ from starlette.routing import Route
 FRED_BASE = "https://api.stlouisfed.org/fred"
 API_KEY = os.environ.get("FRED_API_KEY", "")
 
-# The token clients must present. Unset means the server runs open, which is fine on
-# localhost and wrong anywhere else.
-AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+# The keys clients must present. Comma separated so one can be revoked without
+# disturbing the others. Empty means the server runs open, which is fine on localhost
+# and wrong anywhere else.
+API_KEYS = [k.strip() for k in os.environ.get("MCP_API_KEYS", "").split(",") if k.strip()]
 
 # Caps that keep a tool result small enough for a model to read.
 MAX_SEARCH_RESULTS = 30
@@ -248,20 +253,30 @@ def fred_get_vintage(series_id: str, vintage_date: str, start_date: str = "") ->
     )
 
 
-class BearerAuth(BaseHTTPMiddleware):
-    """Require Authorization: Bearer <MCP_AUTH_TOKEN> on the MCP endpoint.
+def presented_key(request) -> str:
+    """The key the caller sent, by either accepted header."""
+    header = request.headers.get("authorization", "")
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() == "bearer":
+        return value.strip()
+    return request.headers.get("x-api-key", "").strip()
+
+
+class ApiKeyAuth(BaseHTTPMiddleware):
+    """Require a valid API key on the MCP endpoint.
 
     The root page stays open so the platform health check still gets a 200. Only the
-    tools are behind the token.
+    tools are behind the key.
     """
 
     async def dispatch(self, request, call_next):
-        if AUTH_TOKEN and request.url.path.startswith("/mcp"):
-            header = request.headers.get("authorization", "")
-            scheme, _, token = header.partition(" ")
-            if scheme.lower() != "bearer" or not compare_digest(token.strip(), AUTH_TOKEN):
+        if API_KEYS and request.url.path.startswith("/mcp"):
+            given = presented_key(request)
+            # compare_digest against each key, so a wrong key cannot be timed out.
+            if not any(compare_digest(given, k) for k in API_KEYS):
                 return JSONResponse(
-                    {"error": "unauthorized"},
+                    {"error": "unauthorized: send Authorization: Bearer <key> "
+                              "or X-API-Key: <key>"},
                     status_code=401,
                     headers={"WWW-Authenticate": "Bearer"},
                 )
@@ -271,7 +286,7 @@ class BearerAuth(BaseHTTPMiddleware):
 def build_app():
     """The MCP app, plus a root page so a plain health check gets a 200."""
     app = mcp.streamable_http_app()
-    app.add_middleware(BearerAuth)
+    app.add_middleware(ApiKeyAuth)
 
     async def root(request):
         return PlainTextResponse(
@@ -281,7 +296,7 @@ def build_app():
             "fred_get_observations, fred_get_vintage\n"
             f"Catalog: {len(CATALOG)} tracked series\n"
             f"API key configured: {'yes' if API_KEY else 'no'}\n"
-            f"Authentication: {'bearer token required' if AUTH_TOKEN else 'OPEN'}\n"
+            f"Authentication: {'API key required' if API_KEYS else 'OPEN'}\n"
         )
 
     app.router.routes.append(Route("/", root))

@@ -12,7 +12,8 @@ Endpoint: https://fred.kerryback.com/mcp
 
 Requires `FRED_API_KEY` in the environment. The key stays on the server.
 
-`/mcp` requires a bearer token: set `MCP_AUTH_TOKEN` on the server and send
-`Authorization: Bearer <token>` from the client. The root page stays open so the
-platform health check works. With `MCP_AUTH_TOKEN` unset the server runs open,
-which is fine on localhost and wrong anywhere else.
+`/mcp` requires an API key: set `MCP_API_KEYS` (comma separated, so keys can be added
+and revoked one at a time) on the server, and send either `Authorization: Bearer <key>`
+or `X-API-Key: <key>` from the client. The root page stays open so the platform health
+check works. With `MCP_API_KEYS` unset the server runs open, which is fine on localhost
+and wrong anywhere else.
