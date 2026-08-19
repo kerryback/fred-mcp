@@ -6,6 +6,10 @@ server exposing tools, and anything that speaks MCP can call it.
 
 The FRED API key lives in this server's environment, not in the client. Callers get
 the data; they never get the key.
+
+That is exactly why the server itself needs a door. Anyone who can reach /mcp can
+spend this server's API key and read whatever it can read, so /mcp requires a bearer
+token: set MCP_AUTH_TOKEN and clients must send Authorization: Bearer <token>.
 """
 
 import json
@@ -13,14 +17,20 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from hmac import compare_digest
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
-from starlette.responses import PlainTextResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 FRED_BASE = "https://api.stlouisfed.org/fred"
 API_KEY = os.environ.get("FRED_API_KEY", "")
+
+# The token clients must present. Unset means the server runs open, which is fine on
+# localhost and wrong anywhere else.
+AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
 # Caps that keep a tool result small enough for a model to read.
 MAX_SEARCH_RESULTS = 30
@@ -238,9 +248,30 @@ def fred_get_vintage(series_id: str, vintage_date: str, start_date: str = "") ->
     )
 
 
+class BearerAuth(BaseHTTPMiddleware):
+    """Require Authorization: Bearer <MCP_AUTH_TOKEN> on the MCP endpoint.
+
+    The root page stays open so the platform health check still gets a 200. Only the
+    tools are behind the token.
+    """
+
+    async def dispatch(self, request, call_next):
+        if AUTH_TOKEN and request.url.path.startswith("/mcp"):
+            header = request.headers.get("authorization", "")
+            scheme, _, token = header.partition(" ")
+            if scheme.lower() != "bearer" or not compare_digest(token.strip(), AUTH_TOKEN):
+                return JSONResponse(
+                    {"error": "unauthorized"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return await call_next(request)
+
+
 def build_app():
     """The MCP app, plus a root page so a plain health check gets a 200."""
     app = mcp.streamable_http_app()
+    app.add_middleware(BearerAuth)
 
     async def root(request):
         return PlainTextResponse(
@@ -250,6 +281,7 @@ def build_app():
             "fred_get_observations, fred_get_vintage\n"
             f"Catalog: {len(CATALOG)} tracked series\n"
             f"API key configured: {'yes' if API_KEY else 'no'}\n"
+            f"Authentication: {'bearer token required' if AUTH_TOKEN else 'OPEN'}\n"
         )
 
     app.router.routes.append(Route("/", root))
