@@ -14,6 +14,10 @@ a time) and clients send either
 
     Authorization: Bearer <key>
     X-API-Key: <key>
+
+A ?key=<key> query parameter is also accepted, for clients that cannot set a header
+(the claude.ai custom-connector form is one). It is the weaker path -- a key in a URL
+ends up in server logs and browser history -- so prefer a header where you can set one.
 """
 
 import json
@@ -254,12 +258,15 @@ def fred_get_vintage(series_id: str, vintage_date: str, start_date: str = "") ->
 
 
 def presented_key(request) -> str:
-    """The key the caller sent, by either accepted header."""
+    """The key the caller sent, by header or, failing that, query parameter."""
     header = request.headers.get("authorization", "")
     scheme, _, value = header.partition(" ")
-    if scheme.lower() == "bearer":
+    if scheme.lower() == "bearer" and value.strip():
         return value.strip()
-    return request.headers.get("x-api-key", "").strip()
+    from_header = request.headers.get("x-api-key", "").strip()
+    if from_header:
+        return from_header
+    return request.query_params.get("key", "").strip()
 
 
 class ApiKeyAuth(BaseHTTPMiddleware):
@@ -275,8 +282,8 @@ class ApiKeyAuth(BaseHTTPMiddleware):
             # compare_digest against each key, so a wrong key cannot be timed out.
             if not any(compare_digest(given, k) for k in API_KEYS):
                 return JSONResponse(
-                    {"error": "unauthorized: send Authorization: Bearer <key> "
-                              "or X-API-Key: <key>"},
+                    {"error": "unauthorized: send Authorization: Bearer <key>, "
+                              "X-API-Key: <key>, or ?key=<key>"},
                     status_code=401,
                     headers={"WWW-Authenticate": "Bearer"},
                 )
