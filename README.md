@@ -12,11 +12,7 @@ Endpoint: https://fred.kerryback.com/mcp
 
 Requires `FRED_API_KEY` in the environment. The key stays on the server.
 
-`/mcp` is an OAuth 2.1 protected resource. It verifies bearer tokens issued by the
-class authorization server at https://auth.kerryback.com and checks that each token's
-`aud` claim names this resource. Unauthenticated requests get a 401 whose
-`WWW-Authenticate` header points at `/.well-known/oauth-protected-resource`.
+`/mcp` takes no sign-in, no bearer token, and publishes no OAuth discovery document,
+so a client pointed at the URL connects straight away.
 
-Environment: `FRED_API_KEY`, `JWT_SECRET` (shared with the authorization server),
-`AUTH_ISSUER`, `RESOURCE_URL`. With `JWT_SECRET` unset the server runs open, which is
-fine on localhost and wrong anywhere else.
+Environment: `FRED_API_KEY`.
